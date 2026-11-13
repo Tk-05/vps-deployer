@@ -40,8 +40,9 @@ def check(s: Settings, fqdn: str, attempts: int = 10) -> int:
             names = _cert_names(s.npm_https_host, fqdn)
             if fqdn not in names and wildcard not in names:
                 raise SmokeError(f"NPM serves a certificate for {names}, not for {fqdn}")
-            r = httpx.get(f"https://{s.npm_https_host}/", headers={"Host": fqdn}, verify=False, timeout=15,
-                          follow_redirects=False, extensions={"sni_hostname": fqdn})
+            with httpx.Client(verify=False, timeout=15, follow_redirects=False) as client:
+                r = client.get(f"https://{s.npm_https_host}/", headers={"Host": fqdn},
+                               extensions={"sni_hostname": fqdn})
             if r.status_code < 500:
                 return r.status_code
             last = f"HTTP {r.status_code}"

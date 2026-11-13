@@ -38,6 +38,26 @@ def volume_name(name: str) -> str:
     return f"app-{name}-data"
 
 
+# Portainer stack status (api/portainer.go StackStatus)
+STACK_ACTIVE, STACK_INACTIVE, STACK_DEPLOYING, STACK_ERROR = 1, 2, 3, 4
+STACK_POLL_INTERVAL = 2
+
+
+def _stack_id(r: httpx.Response, stack: str) -> int:
+    try:
+        return int(r.json()["Id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise DockerError(f"Portainer: unexpected response creating stack {stack}: {r.text[:300]}") from exc
+
+
+def _stack_error(st: dict) -> str:
+    """Last error message Portainer recorded for the stack's current deployment."""
+    for entry in reversed(st.get("DeploymentStatus") or []):
+        if entry.get("Status") == STACK_ERROR and entry.get("Message"):
+            return str(entry["Message"])[:500]
+    return "unknown error (no message in DeploymentStatus)"
+
+
 # --- Portainer client ----------------------------------------------------------------------------
 
 class Portainer:
@@ -85,13 +105,30 @@ class Portainer:
                 return st
         return None
 
-    def create_stack(self, stack: str, content: str, env: list[dict]) -> None:
-        self.call("POST", "/stacks/create/standalone/string", params={"endpointId": self.endpoint}, timeout=600,
-                  json={"name": stack, "stackFileContent": content, "env": env})
+    def create_stack(self, stack: str, content: str, env: list[dict]) -> int:
+        r = self.call("POST", "/stacks/create/standalone/string", params={"endpointId": self.endpoint},
+                      timeout=600, json={"name": stack, "stackFileContent": content, "env": env})
+        return _stack_id(r, stack)
 
-    def update_stack(self, stack_id: int, content: str, env: list[dict]) -> None:
+    def update_stack(self, stack_id: int, content: str, env: list[dict]) -> int:
         self.call("PUT", f"/stacks/{stack_id}", params={"endpointId": self.endpoint}, timeout=600,
                   json={"stackFileContent": content, "env": env, "prune": True, "pullImage": False})
+        return stack_id
+
+    def wait_stack_deployed(self, stack_id: int, stack: str, timeout: float) -> None:
+        """Portainer (>= 2.4x) deploys compose stacks asynchronously: create/update only store the stack
+        with Status=deploying and return 200. Poll until it is active or errored."""
+        deadline = time.monotonic() + timeout
+        while True:
+            st = self.call("GET", f"/stacks/{stack_id}").json() or {}
+            status = st.get("Status")
+            if status == STACK_ERROR:
+                raise DockerError(f"Portainer could not deploy stack {stack}: {_stack_error(st)}")
+            if status != STACK_DEPLOYING:  # active; older Portainer deploys inline and never reports 3
+                return
+            if time.monotonic() >= deadline:
+                raise DockerError(f"Portainer stack {stack} still deploying after {int(timeout)}s")
+            time.sleep(STACK_POLL_INTERVAL)
 
     def delete_stack(self, stack_id: int) -> None:
         self.call("DELETE", f"/stacks/{stack_id}", params={"endpointId": self.endpoint}, timeout=600,
@@ -148,7 +185,8 @@ def render_compose(s: Settings, *, name: str, project: str, image: str, env: dic
         "container_name": container_name(name),
         "restart": "unless-stopped",
         "networks": [s.apps_network],
-        "security_opt": ["no-new-privileges:true"],
+        # No security_opt/cap_*/privileged/devices/sysctls/bind mounts: environment "vps" forbids them for
+        # regular users and Portainer rejects such a stack (only visible in the stack's DeploymentStatus).
         "mem_limit": s.mem_limit,
         "cpus": float(s.cpu_limit),
         "pids_limit": 512,
@@ -201,23 +239,32 @@ def find_stack(s: Settings, name: str) -> dict | None:
 
 
 def up(s: Settings, name: str, doc: dict) -> None:
-    """Create or update the Portainer stack app-<name> and bring it up."""
+    """Create or update the Portainer stack app-<name>, wait until Portainer has deployed it and check that
+    the container exists. Raises DockerError with Portainer's own error message if the deployment failed."""
     content = MANAGED_HEADER + yaml.safe_dump(doc, sort_keys=False)
     env = read_secrets(s, name)
     with Portainer(s) as p:
         stack = p.find_stack(project_name(name))
         if stack:
-            p.update_stack(stack["Id"], content, env)
-            return
-        # App deployed before the switch to Portainer (plain docker compose): Portainer refuses a stack whose
-        # project/container name is already taken, so remove the old managed container first. The named volume
-        # is kept and re-used by the stack.
-        old = _inspect_container(p, name)
-        if old:
-            if (old.get("Config", {}).get("Labels") or {}).get("de.tk05.managed") != "true":
-                raise DockerError(f"container {container_name(name)} exists and is not managed by vps-deployer")
-            p.docker("DELETE", f"/containers/{container_name(name)}", params={"force": "true"}, allow_404=True)
-        p.create_stack(project_name(name), content, env)
+            stack_id = p.update_stack(stack["Id"], content, env)
+        else:
+            stack_id = _create(p, name, content, env)
+        p.wait_stack_deployed(stack_id, project_name(name), s.health_timeout)
+        if _inspect_container(p, name) is None:
+            raise DockerError(f"Portainer reports stack {project_name(name)} as deployed, but container "
+                              f"{container_name(name)} does not exist on environment {s.portainer_endpoint_id}")
+
+
+def _create(p: "Portainer", name: str, content: str, env: list[dict]) -> int:
+    # App deployed before the switch to Portainer (plain docker compose): Portainer refuses a stack whose
+    # project/container name is already taken, so remove the old managed container first. The named volume
+    # is kept and re-used by the stack.
+    old = _inspect_container(p, name)
+    if old:
+        if (old.get("Config", {}).get("Labels") or {}).get("de.tk05.managed") != "true":
+            raise DockerError(f"container {container_name(name)} exists and is not managed by vps-deployer")
+        p.docker("DELETE", f"/containers/{container_name(name)}", params={"force": "true"}, allow_404=True)
+    return p.create_stack(project_name(name), content, env)
 
 
 def down(s: Settings, name: str, *, remove_volume: bool = False) -> None:

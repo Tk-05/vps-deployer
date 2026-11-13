@@ -97,8 +97,9 @@ def test_compose_template_is_locked_down():
     text = yaml.safe_dump(doc)
     svc = doc["services"]["app"]
     assert svc["container_name"] == "app-foo"
-    assert "ports" not in svc and "privileged" not in svc and "cap_add" not in svc
-    assert svc["security_opt"] == ["no-new-privileges:true"]
+    assert "ports" not in svc
+    for key in ("security_opt", "privileged", "cap_add", "cap_drop", "devices", "sysctls", "pid"):
+        assert key not in svc, key
     assert svc["environment"]["PASS"] == "a$$b"
     assert svc["volumes"] == ["app-foo-data:/data"]
     assert doc["networks"] == {s.apps_network: {"external": True}}
@@ -131,13 +132,37 @@ def test_demux_logs():
 
 
 class FakePortainer:
-    """Minimal Portainer API: stacks + Docker proxy calls the deployer uses."""
+    """Minimal Portainer API: stacks + Docker proxy calls the deployer uses.
+
+    Like Portainer >= 2.4x, create/update only store the stack with Status=3 (deploying); the deployment
+    "happens" on the next GET /stacks/{id} (Status 1 + container, or Status 4 + DeploymentStatus message).
+    """
 
     def __init__(self):
         self.stacks: list[dict] = []
         self.containers: dict[str, dict] = {}
         self.calls: list[tuple[str, str]] = []
         self.pull_error: str | None = None
+        self.deploy_error: str | None = None
+        self.deploy_creates_container = True
+
+    def _deploy(self, st: dict) -> None:
+        st.update(Status=3, pending=True, DeploymentStatus=[{"Status": 3, "Time": 1}])
+
+    def _finish_deploy(self, st: dict) -> None:
+        st.pop("pending")
+        if self.deploy_error:
+            st["Status"] = 4
+            st["DeploymentStatus"].append({"Status": 4, "Message": self.deploy_error, "Time": 2})
+            return
+        st["Status"] = 1
+        st["DeploymentStatus"].append({"Status": 1, "Time": 2})
+        if self.deploy_creates_container:
+            svc = yaml.safe_load(st["content"])["services"]["app"]
+            self.containers[svc["container_name"]] = {
+                "Config": {"Labels": svc.get("labels") or {}},
+                "State": {"Status": "running", "Running": True},
+            }
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["X-API-Key"] == "ptr_test"
@@ -150,11 +175,20 @@ class FakePortainer:
             assert req.url.params["endpointId"] == "3"
             self.stacks.append({"Id": len(self.stacks) + 1, "Name": body["name"], "EndpointId": 3,
                                 "content": body["stackFileContent"], "Env": body["env"]})
+            self._deploy(self.stacks[-1])
             return httpx.Response(200, json=self.stacks[-1])
+        if path.startswith("/api/stacks/") and method == "GET":
+            st = next((x for x in self.stacks if x["Id"] == int(path.rsplit("/", 1)[1])), None)
+            if st is None:
+                return httpx.Response(404, json={"message": "Unable to find a stack with the specified identifier"})
+            if st.get("pending"):
+                self._finish_deploy(st)
+            return httpx.Response(200, json=st)
         if path.startswith("/api/stacks/") and method == "PUT":
             body = json.loads(req.content)
             st = next(x for x in self.stacks if x["Id"] == int(path.rsplit("/", 1)[1]))
             st.update(content=body["stackFileContent"], Env=body["env"])
+            self._deploy(st)
             return httpx.Response(200, json=st)
         if path.startswith("/api/stacks/") and method == "DELETE":
             self.stacks = [x for x in self.stacks if x["Id"] != int(path.rsplit("/", 1)[1])]
@@ -181,6 +215,7 @@ class FakePortainer:
 def portainer(monkeypatch, tmp_path):
     fake = FakePortainer()
     monkeypatch.setattr(docker_ops.Portainer, "transport", httpx.MockTransport(fake))
+    monkeypatch.setattr(docker_ops, "STACK_POLL_INTERVAL", 0)
     return fake, dataclasses.replace(Settings(), apps_dir=str(tmp_path))
 
 
@@ -224,7 +259,44 @@ def test_legacy_container_is_migrated_only_if_managed(portainer):
 
     fake.containers["app-foo"] = {"Config": {"Labels": {"de.tk05.managed": "true"}}}
     docker_ops.up(s, "foo", doc)
-    assert "app-foo" not in fake.containers and [x["Name"] for x in fake.stacks] == ["app-foo"]
+    # old container removed, the stack deployment then creates it again
+    assert ("DELETE", "/api/endpoints/3/docker/containers/app-foo") in fake.calls
+    assert [x["Name"] for x in fake.stacks] == ["app-foo"]
+
+
+def _foo_doc(s):
+    return docker_ops.render_compose(s, name="foo", project="Foo", image=PREFIX + "foo" + DIGEST, env={},
+                                     volume_path=None)
+
+
+def test_async_stack_deploy_waits_until_active(portainer):
+    fake, s = portainer
+    docker_ops.up(s, "foo", _foo_doc(s))
+    assert ("GET", "/api/stacks/1") in fake.calls
+    assert fake.stacks[0]["Status"] == 1 and "app-foo" in fake.containers
+
+
+def test_async_stack_deploy_error_is_surfaced(portainer):
+    # Regression e203ff81052c: Portainer accepted the stack with 200 and rejected it in the background.
+    fake, s = portainer
+    fake.deploy_error = "stack config file is invalid: security-opt setting disabled for non administrator users"
+    with pytest.raises(docker_ops.DockerError,
+                       match="could not deploy stack app-foo: stack config file is invalid: security-opt"):
+        docker_ops.up(s, "foo", _foo_doc(s))
+
+
+def test_stack_active_but_container_missing(portainer):
+    fake, s = portainer
+    fake.deploy_creates_container = False
+    with pytest.raises(docker_ops.DockerError, match="container app-foo does not exist"):
+        docker_ops.up(s, "foo", _foo_doc(s))
+
+
+def test_stack_still_deploying_times_out(portainer, monkeypatch):
+    fake, s = portainer
+    monkeypatch.setattr(fake, "_deploy", lambda st: st.update(Status=3, DeploymentStatus=[{"Status": 3}]))
+    with pytest.raises(docker_ops.DockerError, match="still deploying"):
+        docker_ops.up(dataclasses.replace(s, health_timeout=0), "foo", _foo_doc(s))
 
 
 def test_wildcard_dns_mode(monkeypatch):
