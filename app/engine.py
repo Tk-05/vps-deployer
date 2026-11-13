@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 
 from . import db
 from .config import Settings
@@ -28,11 +27,6 @@ def cloudflare(s: Settings) -> Cloudflare | None:
     return Cloudflare(s) if s.cf_api_token else None
 
 
-def _container_exists(name: str) -> bool:
-    proc = subprocess.run(["docker", "inspect", docker_ops.container_name(name)], capture_output=True)
-    return proc.returncode == 0
-
-
 def _check_name_free(s: Settings, name: str) -> None:
     """For a new app: nothing else may already use the name (NPM host, foreign DNS record, container)."""
     fqdn = fqdn_for(s, name)
@@ -44,7 +38,9 @@ def _check_name_free(s: Settings, name: str) -> None:
             cf.check_free(fqdn)
         except RuntimeError as exc:
             raise Conflict(str(exc)) from exc
-    if _container_exists(name):
+    if docker_ops.find_stack(s, name):
+        raise Conflict(f"a Portainer stack {docker_ops.project_name(name)} already exists")
+    if docker_ops.container_exists(s, name):
         raise Conflict(f"a container {docker_ops.container_name(name)} already exists")
 
 
@@ -76,8 +72,8 @@ def prepare_deploy(s: Settings, *, project: str, image: str, subdomain: str | No
             raise ValidationError(str(exc)) from exc
 
     # Pulling only downloads the image (no running change); needed to verify it exists and to read EXPOSE.
-    docker_ops.pull(image)
-    meta = docker_ops.inspect_image(image)
+    docker_ops.pull(s, image)
+    meta = docker_ops.inspect_image(s, image)
     if port is None:
         port = port_from_image(meta["exposed_ports"], meta["labels"]) or (app["port"] if app else None)
     if port is None:
@@ -145,13 +141,12 @@ def _run_deploy(s: Settings, dep: dict, say) -> str:
         cert_id = npm.wildcard_certificate_id()
 
         say(f"pulling {image}")
-        docker_ops.pull(image)
+        docker_ops.pull(s, image)
         doc = docker_ops.render_compose(s, name=name, project=dep["project"], image=image, env=dep["env"],
                                         volume_path=dep["volume_path"])
-        docker_ops.write_compose(s, name, doc)
         undo.append(("container", None))
-        say("starting container")
-        docker_ops.up(s, name)
+        say(f"Portainer: deploying stack {docker_ops.project_name(name)}")
+        docker_ops.up(s, name, doc)
         say(f"waiting for app on port {port}")
         docker_ops.wait_ready(s, name, port)
 
@@ -219,8 +214,7 @@ def _rollback(s: Settings, name: str, previous: dict | None, undo: list, npm: Np
                 say(f"rollback: restoring previous image {previous['image']}")
                 doc = docker_ops.render_compose(s, name=name, project=previous["project"], image=previous["image"],
                                                 env=previous["env"], volume_path=previous["volume_path"])
-                docker_ops.write_compose(s, name, doc)
-                docker_ops.up(s, name)
+                docker_ops.up(s, name, doc)
                 docker_ops.wait_ready(s, name, previous["port"])
             else:
                 say("rollback: removing container")

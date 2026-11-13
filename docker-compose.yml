@@ -1,0 +1,58 @@
+name: vps-deployer
+
+# Deployed as a Portainer stack (Stacks > Add stack > Repository, compose path docker-compose.yml).
+# All settings are Portainer stack environment variables, see .env.example for the list (it can be loaded
+# there via "Load variables from .env file"). Nothing is read from a file on the host.
+# The image is built by GitHub Actions (.github/workflows/build.yml) and pulled from GHCR with the ghcr.io
+# registry configured in Portainer.
+
+services:
+  deployer:
+    image: ${DEPLOYER_IMAGE:-ghcr.io/tk-05/vps-deployer:latest}
+    container_name: vps-deployer
+    restart: unless-stopped
+    # ":?" = required, the stack does not deploy without it. Empty optional values fall back to the
+    # defaults in app/config.py.
+    environment:
+      DEPLOYER_API_TOKEN: ${DEPLOYER_API_TOKEN:?set DEPLOYER_API_TOKEN}
+      BASE_DOMAIN: ${BASE_DOMAIN:-}
+      IMAGE_PREFIX: ${IMAGE_PREFIX:-}
+      RESERVED_NAMES: ${RESERVED_NAMES:-}
+      CF_API_TOKEN: ${CF_API_TOKEN:-}
+      CF_ZONE_NAME: ${CF_ZONE_NAME:-}
+      PUBLIC_IPV4: ${PUBLIC_IPV4:?set PUBLIC_IPV4}
+      PUBLIC_IPV6: ${PUBLIC_IPV6:-}
+      NPM_URL: ${NPM_URL:-}
+      NPM_HTTPS_HOST: ${NPM_HTTPS_HOST:-}
+      NPM_IDENTITY: ${NPM_IDENTITY:?set NPM_IDENTITY}
+      NPM_SECRET: ${NPM_SECRET:?set NPM_SECRET}
+      PORTAINER_URL: ${PORTAINER_URL:-}
+      PORTAINER_API_KEY: ${PORTAINER_API_KEY:?set PORTAINER_API_KEY}
+      PORTAINER_ENDPOINT_ID: ${PORTAINER_ENDPOINT_ID:?set PORTAINER_ENDPOINT_ID}
+      PORTAINER_REGISTRY_ID: ${PORTAINER_REGISTRY_ID:-}
+      PORTAINER_VERIFY_TLS: ${PORTAINER_VERIFY_TLS:-}
+      APP_MEM_LIMIT: ${APP_MEM_LIMIT:-}
+      APP_CPU_LIMIT: ${APP_CPU_LIMIT:-}
+      HEALTH_TIMEOUT: ${HEALTH_TIMEOUT:-}
+      PENDING_TTL_HOURS: ${PENDING_TTL_HOURS:-}
+    ports:
+      # Only reachable over Tailscale, never public
+      - "${TAILSCALE_IP:?set TAILSCALE_IP}:8787:8000"
+    # No Docker socket: all container operations go through the Portainer API (PORTAINER_URL).
+    # Absolute host paths: Portainer resolves relative paths inside its own stack directory.
+    volumes:
+      - /opt/vps-deployer/apps:/opt/vps-deployer/apps     # hand-maintained secrets.env per app
+      - /opt/vps-deployer/data:/data
+      - proxy_npm-letsencrypt:/etc/letsencrypt:ro         # certificate preflight check
+    networks:
+      # "apps" reaches NPM and the app containers (readiness check). Portainer must also be reachable
+      # under PORTAINER_URL, e.g. by putting the Portainer container into this network as well.
+      - apps
+
+networks:
+  apps:
+    external: true
+
+volumes:
+  proxy_npm-letsencrypt:
+    external: true

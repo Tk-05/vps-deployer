@@ -77,7 +77,7 @@ def create_deployment(req: DeployRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc))
     except engine.Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    except RuntimeError as exc:  # docker pull / NPM / Cloudflare unreachable
+    except RuntimeError as exc:  # Portainer pull / NPM / Cloudflare unreachable
         raise HTTPException(status_code=502, detail=str(exc))
     return _public(dep)
 

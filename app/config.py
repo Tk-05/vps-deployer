@@ -1,4 +1,8 @@
-"""Settings, all from environment variables (see .env.example)."""
+"""Settings, all from environment variables (Portainer stack variables, see .env.example).
+
+An empty variable counts as unset: the stack passes every variable through (`${VAR:-}`), so empty must mean
+"use the default" (and for required ones: missing), never "empty value".
+"""
 from __future__ import annotations
 
 import os
@@ -6,14 +10,14 @@ from dataclasses import dataclass, field
 
 
 def _env(name: str, default: str | None = None) -> str:
-    value = os.environ.get(name, default)
+    value = os.environ.get(name, "").strip() or default
     if value is None:
         raise RuntimeError(f"missing required environment variable {name}")
     return value
 
 
 def _csv(name: str, default: str) -> list[str]:
-    return [v.strip().lower() for v in os.environ.get(name, default).split(",") if v.strip()]
+    return [v.strip().lower() for v in _env(name, default).split(",") if v.strip()]
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,16 @@ class Settings:
     apps_dir: str = field(default_factory=lambda: _env("APPS_DIR", "/opt/vps-deployer/apps"))
     letsencrypt_dir: str = field(default_factory=lambda: _env("LETSENCRYPT_DIR", "/etc/letsencrypt"))
 
-    # Docker
+    # Portainer (all Docker access goes through its API, no Docker socket)
+    portainer_url: str = field(default_factory=lambda: _env("PORTAINER_URL", "http://portainer:9000"))
+    portainer_api_key: str = field(default_factory=lambda: _env("PORTAINER_API_KEY"))
+    portainer_endpoint_id: int = field(default_factory=lambda: int(_env("PORTAINER_ENDPOINT_ID")))
+    # Registry configured in Portainer (ghcr.io) whose credentials Portainer uses for pulls. 0 = none.
+    portainer_registry_id: int = field(default_factory=lambda: int(_env("PORTAINER_REGISTRY_ID", "0")))
+    portainer_verify_tls: bool = field(
+        default_factory=lambda: _env("PORTAINER_VERIFY_TLS", "true").strip().lower() not in ("0", "false", "no"))
+
+    # Containers
     apps_network: str = field(default_factory=lambda: _env("APPS_NETWORK", "apps"))
     mem_limit: str = field(default_factory=lambda: _env("APP_MEM_LIMIT", "512m"))
     cpu_limit: str = field(default_factory=lambda: _env("APP_CPU_LIMIT", "1.0"))

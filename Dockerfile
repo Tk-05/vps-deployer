@@ -1,9 +1,5 @@
-FROM docker:29-cli AS dockercli
-
 FROM python:3.12-slim
-# Docker CLI + compose plugin only (talks to the host daemon through the mounted socket)
-COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+# No Docker CLI and no Docker socket: containers are managed through the Portainer API.
 
 WORKDIR /srv
 COPY requirements.txt .
